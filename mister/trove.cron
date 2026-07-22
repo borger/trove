@@ -1,0 +1,3 @@
+# Trove auto-sync — installed by install.sh, removed by uninstall.sh.
+# The '# TROVE' sentinel is used to find + replace this entry on updates.
+0 3 * * *  /media/fat/Scripts/.trove/bin/trove sync --quiet  # TROVE
