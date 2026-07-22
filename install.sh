@@ -124,16 +124,59 @@ if [ -d "$SCRIPTS_DIR" ]; then
 fi
 
 # ── cron entry ────────────────────────────────────────────────────────────
-if [ "$NO_CRON" -eq 0 ]; then
-    if command -v crontab >/dev/null 2>&1; then
-        SCHEDULE="$(python3 -c "import json,sys; c=json.load(open('$TROVE_HOME/config.json')) if __import__('os').path.exists('$TROVE_HOME/config.json') else {}; print(((c.get('cron') or {}).get('schedule')) or '0 3 * * *')" 2>/dev/null || echo "0 3 * * *")"
-        CMD="$TROVE_HOME/bin/trove sync --quiet"
-        MARK="# TROVE"
-        # Remove any prior trove line, then append fresh
-        (crontab -l 2>/dev/null | grep -v "$MARK"; echo "$SCHEDULE  $CMD  $MARK") | crontab -
-        log "cron entry set: $SCHEDULE  $CMD"
+# MiSTer's stock userland ships crond but doesn't run it by default. We use
+# /etc/cron.d/ (drop-in style) rather than `crontab -` (which needs the
+# missing spool dir). If cron isn't running, we skip + print instructions.
+
+crond_is_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep crond >/dev/null 2>&1
     else
-        warn "crontab not available — skipping auto-sync cron entry"
+        ps -ef 2>/dev/null | grep -v grep | grep -q crond
+    fi
+}
+
+install_cron_entry() {
+    local schedule cmd
+    schedule="$(python3 -c "import json,sys,os; p='$TROVE_HOME/config.json'; c=json.load(open(p)) if os.path.exists(p) else {}; print(((c.get('cron') or {}).get('schedule')) or '0 3 * * *')" 2>/dev/null || echo "0 3 * * *")"
+    cmd="$TROVE_HOME/bin/trove sync --quiet"
+    # /etc/cron.d/ format needs the user field (root, since MiSTer runs as root).
+    if [ ! -w /etc/cron.d ] && [ ! -w /etc ]; then
+        warn "cannot write /etc/cron.d/trove (no permission?) — skipping cron"
+        return 1
+    fi
+    printf '# Installed by Trove — remove with trove uninstall.\n%s  root  %s\n' "$schedule" "$cmd" > /etc/cron.d/trove
+    chmod 644 /etc/cron.d/trove
+    log "cron entry installed: /etc/cron.d/trove ($schedule)"
+    return 0
+}
+
+print_cron_setup_hint() {
+    cat <<'EOF'
+
+Auto-sync scheduling is NOT active because MiSTer's cron daemon isn't running
+on this system. To enable scheduled auto-sync, add this line to your
+/media/fat/linux/user-startup.sh (create the file if it doesn't exist):
+
+    /usr/sbin/crond -b
+
+Then reboot the MiSTer (or run the command once manually) and re-run this
+installer to add the schedule. Until then, you can sync manually anytime with:
+
+    /media/fat/Scripts/.trove/bin/trove sync
+
+EOF
+}
+
+if [ "$NO_CRON" -eq 0 ]; then
+    if crond_is_running; then
+        install_cron_entry || true
+    else
+        warn "cron daemon (crond) is not running on this MiSTer — auto-sync will not fire"
+        # Drop the cron.d file anyway so it activates automatically if the user
+        # enables crond later. Also print the setup hint.
+        install_cron_entry || true
+        print_cron_setup_hint
     fi
 else
     log "cron skipped (--no-cron)"

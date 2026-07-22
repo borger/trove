@@ -27,8 +27,10 @@ log "removing launcher symlink"
 rm -f "$SCRIPTS_DIR/$LAUNCHER_NAME"
 
 log "removing cron entry"
+rm -f /etc/cron.d/trove
+# Legacy: also clean out anything we may have added to the root crontab.
 if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v '# TROVE') | crontab -
+    (crontab -l 2>/dev/null | grep -v '# TROVE') 2>/dev/null | crontab - 2>/dev/null || true
 fi
 
 if [ "$PURGE" -eq 1 ]; then
