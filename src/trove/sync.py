@@ -613,25 +613,32 @@ def _download_stream_to(
     dest_path: str,
     iter_chunks,
     on_progress: Callable[[int], None] | None = None,
-) -> int:
+    compute_hash: bool = False,
+) -> tuple[int, str | None]:
     """Write an iterator of bytes to a local path atomically (via .part rename).
 
-    Returns bytes written. Calls ``on_progress(bytes_written_so_far)`` after
-    each chunk if provided (throttling is the callback's responsibility).
+    Returns (bytes_written, md5_hex or None). When ``compute_hash=True`` we
+    accumulate MD5 during the write — this makes hashing essentially free
+    (no separate file re-read), which matters a lot on MiSTer's SD card where
+    a post-hoc ``md5sum`` on a multi-GB CHD would hang for minutes without
+    any output. Callers use the returned hash to populate the manifest.
     """
     tmp = dest_path + ".part"
     _mkdir_p(os.path.dirname(dest_path))
     written = 0
+    hasher = hashlib.md5() if compute_hash else None
     with open(tmp, "wb") as f:
         for chunk in iter_chunks:
             if not chunk:
                 continue
             f.write(chunk)
+            if hasher is not None:
+                hasher.update(chunk)
             written += len(chunk)
             if on_progress:
                 on_progress(written)
     os.replace(tmp, dest_path)
-    return written
+    return written, (hasher.hexdigest() if hasher else None)
 
 
 def _sync_mtime_to_updated_at(local_path: str, updated_at_iso: str) -> None:
@@ -649,26 +656,34 @@ def _sync_mtime_to_updated_at(local_path: str, updated_at_iso: str) -> None:
         pass
 
 
-def _download_rom(client, action: SyncAction, log: Callable[[str], None] | None = None) -> int:
+def _download_rom(client, action: SyncAction, log: Callable[[str], None] | None = None) -> str | None:
+    """Download a ROM. Returns the MD5 hex we computed inline (or None on failure)."""
     resp = client.stream_rom(action.rom_id, action.file_name)
     try:
         total = int(resp.headers.get("content-length", 0)) or int(action.size_romm or 0)
         reporter = _ProgressReporter(log, total)
-        _download_stream_to(action.remote_path, resp.iter_content(), on_progress=reporter.update)
+        _, md5_hex = _download_stream_to(
+            action.remote_path, resp.iter_content(),
+            on_progress=reporter.update, compute_hash=True,
+        )
     finally:
         resp.close()
-    return action.size_romm or int(os.stat(action.remote_path).st_size)
+    return md5_hex
 
 
-def _download_asset(client, action: SyncAction, asset_kind: str, log: Callable[[str], None] | None = None) -> None:
+def _download_asset(client, action: SyncAction, asset_kind: str, log: Callable[[str], None] | None = None) -> str | None:
     resp = client.stream_asset(asset_kind, action.asset_id)
     try:
         total = int(resp.headers.get("content-length", 0)) or int(action.size_romm or 0)
         reporter = _ProgressReporter(log, total)
-        _download_stream_to(action.remote_path, resp.iter_content(), on_progress=reporter.update)
+        _, md5_hex = _download_stream_to(
+            action.remote_path, resp.iter_content(),
+            on_progress=reporter.update, compute_hash=True,
+        )
     finally:
         resp.close()
     _sync_mtime_to_updated_at(action.remote_path, action.asset_updated_at)
+    return md5_hex
 
 
 def _upload_asset(client, action: SyncAction, asset_kind: str) -> None:
@@ -731,12 +746,12 @@ def execute_sync(
 
             elif a.kind == "download":
                 log(f"↓ {a.rom_name}  ({_human_bytes(a.size_romm)})")
-                _download_rom(client, a, log=log); _mark_placed(a); stats["downloaded"] += 1
+                h = _download_rom(client, a, log=log); _mark_placed(a, h); stats["downloaded"] += 1
 
             elif a.kind == "overwrite":
                 if on_rom_conflict == RomConflictPolicy.ROMM_WINS:
                     log(f"↓ overwrite {a.rom_name} ({_human_bytes(a.size_romm)}, romm wins)")
-                    _download_rom(client, a, log=log); _mark_placed(a); stats["overwritten"] += 1
+                    h = _download_rom(client, a, log=log); _mark_placed(a, h); stats["overwritten"] += 1
                 elif on_rom_conflict == RomConflictPolicy.MISTER_WINS:
                     log(f"= keep MiSTer copy of {a.file_name}"); stats["skipped"] += 1
                 else:
@@ -758,12 +773,12 @@ def execute_sync(
 
             elif a.kind == "save_download":
                 log(f"↓ save {a.file_name} ({_human_bytes(a.size_romm)})")
-                _download_asset(client, a, "save", log=log)
-                _mark_placed(a); stats["saves_down"] += 1
+                h = _download_asset(client, a, "save", log=log)
+                _mark_placed(a, h); stats["saves_down"] += 1
             elif a.kind == "state_download":
                 log(f"↓ state {a.file_name} ({_human_bytes(a.size_romm)})")
-                _download_asset(client, a, "state", log=log)
-                _mark_placed(a); stats["states_down"] += 1
+                h = _download_asset(client, a, "state", log=log)
+                _mark_placed(a, h); stats["states_down"] += 1
 
             elif a.kind == "save_upload":
                 log(f"↑ save {a.file_name}"); _upload_asset(client, a, "save")
@@ -778,11 +793,11 @@ def execute_sync(
                 if on_asset_conflict == AssetConflictPolicy.NEWEST_WINS:
                     # planner would've picked direction; conflict means times equal → prefer RomM.
                     log(f"↓ {kind} conflict → romm wins (times ambiguous) {a.file_name}")
-                    _download_asset(client, a, kind, log=log); _mark_placed(a)
+                    h = _download_asset(client, a, kind, log=log); _mark_placed(a, h)
                     stats["saves_down" if kind == "save" else "states_down"] += 1
                 elif on_asset_conflict == AssetConflictPolicy.ROMM_WINS:
                     log(f"↓ {kind} conflict → romm wins (policy) {a.file_name}")
-                    _download_asset(client, a, kind, log=log); _mark_placed(a)
+                    h = _download_asset(client, a, kind, log=log); _mark_placed(a, h)
                     stats["saves_down" if kind == "save" else "states_down"] += 1
                 elif on_asset_conflict == AssetConflictPolicy.MISTER_WINS:
                     log(f"↑ {kind} conflict → mister wins (policy) {a.file_name}")
@@ -848,7 +863,8 @@ def download_firmware_for_platform(
             try:
                 total = int(resp.headers.get("content-length", 0)) or r_size
                 reporter = _ProgressReporter(log, total)
-                _download_stream_to(remote_path, resp.iter_content(), on_progress=reporter.update)
+                _download_stream_to(remote_path, resp.iter_content(),
+                                    on_progress=reporter.update, compute_hash=False)
             finally:
                 resp.close()
             stats["downloaded"] += 1

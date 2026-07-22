@@ -375,6 +375,76 @@ def cmd_doctor(args, log) -> int:
     return 0 if ok else 1
 
 
+def cmd_disable_cron(args, log) -> int:
+    """Stop crond right now AND remove the Trove-added line from user-startup.sh.
+
+    Does NOT remove the cron entry file itself (that's what `trove uninstall`
+    handles) — this is a "pause auto-sync" toggle, not a permanent removal.
+    """
+    startup = Path("/media/fat/linux/user-startup.sh")
+    line = "/usr/sbin/crond -b"
+    marker = "# Added by Trove"
+
+    # 1) Stop crond if running
+    if _crond_running():
+        try:
+            # Try nice first, then hard
+            subprocess.call(["killall", "crond"], stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            try:
+                out = subprocess.check_output(["ps", "-ef"], stderr=subprocess.DEVNULL).decode()
+                pids = [
+                    line.split()[1]
+                    for line in out.splitlines()
+                    if "crond" in line and "grep" not in line
+                ]
+                for pid in pids:
+                    subprocess.call(["kill", pid], stderr=subprocess.DEVNULL)
+            except Exception as e:
+                log.error("could not stop crond: %s", e)
+                return 3
+        if _crond_running():
+            log.warning("crond may still be running — try `killall crond` manually")
+        else:
+            log.info("crond stopped.")
+    else:
+        log.info("crond is not running.")
+
+    # 2) Remove our lines from user-startup.sh so it stays stopped across reboots
+    if startup.exists():
+        try:
+            original = startup.read_text().splitlines(keepends=False)
+            kept: list[str] = []
+            skip_next = False
+            for l in original:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if marker in l:
+                    skip_next = True   # also drop the line right after our marker comment
+                    continue
+                if l.strip() == line:
+                    continue
+                kept.append(l)
+            new_content = "\n".join(kept).rstrip() + "\n" if kept else ""
+            if new_content != startup.read_text():
+                if new_content.strip():
+                    startup.write_text(new_content)
+                    log.info("removed Trove's crond line from %s", startup)
+                else:
+                    startup.unlink()
+                    log.info("removed %s (was empty after cleanup)", startup)
+            else:
+                log.info("no Trove-added lines found in %s", startup)
+        except OSError as e:
+            log.error("could not edit %s: %s", startup, e)
+            return 3
+
+    log.info("Auto-sync is now disabled. Cron entry file left in place — "
+             "run `trove enable-cron` to resume, or `install.sh --purge` (via uninstall) to fully remove.")
+    return 0
+
+
 def cmd_enable_cron(args, log) -> int:
     """Start BusyBox crond now AND persist to user-startup.sh."""
     startup = Path("/media/fat/linux/user-startup.sh")
@@ -452,6 +522,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_enable_cron = sub.add_parser("enable-cron",
         help="start crond now + persist to user-startup.sh so auto-sync fires")
     p_enable_cron.set_defaults(func=cmd_enable_cron)
+
+    p_disable_cron = sub.add_parser("disable-cron",
+        help="stop crond now + remove Trove's line from user-startup.sh")
+    p_disable_cron.set_defaults(func=cmd_disable_cron)
 
     return p
 
