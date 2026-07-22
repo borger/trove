@@ -720,7 +720,10 @@ def execute_sync(
         "errors": 0,
     }
 
-    def _snapshot(remote_path: str) -> dict:
+    def _snapshot(remote_path: str, precomputed_hash: str | None = None) -> dict:
+        # mtime+size only — hash is populated only when the caller has one from
+        # inline computation during download. Re-reading a multi-GB file just to
+        # md5 it was the source of the multi-minute post-download hang.
         entry: dict = {}
         try:
             st = os.stat(remote_path)
@@ -728,13 +731,12 @@ def execute_sync(
             entry["size"] = int(st.st_size)
         except OSError:
             pass
-        h = _local_md5(remote_path)
-        if h:
-            entry["hash"] = h
+        if precomputed_hash:
+            entry["hash"] = precomputed_hash
         return entry
 
-    def _mark_placed(a: SyncAction) -> None:
-        manifest[_relpath_key(a.remote_path, mister_root)] = _snapshot(a.remote_path)
+    def _mark_placed(a: SyncAction, precomputed_hash: str | None = None) -> None:
+        manifest[_relpath_key(a.remote_path, mister_root)] = _snapshot(a.remote_path, precomputed_hash)
 
     def _mark_removed(a: SyncAction) -> None:
         manifest.pop(_relpath_key(a.remote_path, mister_root), None)
