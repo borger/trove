@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "romm": {
+    "url": "https://romm.example.com",
+    "token": null
+  },
+  "mister": {
+    "root": "/media/fat"
+  },
+  "subscriptions": {
+    "collections": []
+  },
+  "sync": {
+    "saves_and_states": true,
+    "on_rom_conflict": "romm_wins",
+    "on_asset_conflict": "newest_wins",
+    "on_orphan": "keep",
+    "emulator_filter": "mister_only"
+  },
+  "cron": {
+    "schedule": "0 3 * * *",
+    "enabled": true
+  },
+  "logging": {
+    "level": "INFO",
+    "max_bytes": 5242880,
+    "backup_count": 3
+  }
+}

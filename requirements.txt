@@ -1,0 +1,2 @@
+# Trove intentionally uses only the Python stdlib on the MiSTer runtime target.
+# No external packages are required to install or run Trove.

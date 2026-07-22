@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Trove CLI wrapper — resolves the install root and invokes `python3 -m trove`.
+set -eu
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m trove "$@"
