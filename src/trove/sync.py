@@ -18,6 +18,7 @@ import hashlib
 import os
 import posixpath
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
@@ -26,6 +27,12 @@ from .mister_cores import core_folder_for_slug, saves_dir, states_dir
 
 # Timestamps within this window are treated as "equal" (clock skew / rounding).
 _MTIME_TOLERANCE_SECONDS = 5
+
+# Files smaller than this get no in-flight progress (they finish fast enough
+# that a single ↓ line is enough). Anything bigger — or unknown-size — reports.
+_PROGRESS_MIN_BYTES = 5 * 1024 * 1024   # 5 MB
+_PROGRESS_MIN_INTERVAL = 1.5             # seconds between updates
+_PROGRESS_MIN_PERCENT_STEP = 15          # or every N% delta, whichever hits first
 
 
 # ── policy constants ───────────────────────────────────────────────────────
@@ -120,6 +127,64 @@ def _parse_iso_to_unix(iso: str) -> float | None:
         return t.timestamp()
     except Exception:
         return None
+
+
+def _human_bytes(n) -> str:
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "?"
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{int(n)}{u}" if u == "B" else f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+class _ProgressReporter:
+    """Throttled per-file progress logger for large downloads.
+
+    Emits INFO log lines like ``  ↳ 12.3MB/29.0MB (42%, 5.2MB/s, eta 3s)`` at
+    most every ``_PROGRESS_MIN_INTERVAL`` seconds OR every
+    ``_PROGRESS_MIN_PERCENT_STEP`` % of total, whichever fires first. Silent
+    for files smaller than ``_PROGRESS_MIN_BYTES`` — no clutter for NES ROMs.
+    """
+
+    def __init__(self, log: Callable[[str], None] | None, total_bytes: int):
+        self.log = log
+        self.total = int(total_bytes or 0)
+        # Enable progress reporting when file is big, OR when we don't know the
+        # size at all (unknown size = we can't tell if it's small, safer to show).
+        self.enabled = bool(log) and (self.total >= _PROGRESS_MIN_BYTES or self.total == 0)
+        self.start = time.monotonic()
+        self.last_time = self.start
+        self.last_pct = -1
+
+    def update(self, written: int) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        elapsed_since_last = now - self.last_time
+        pct = int(written * 100 / self.total) if self.total else -1
+        pct_step = pct - self.last_pct if self.total else 0
+        if (
+            elapsed_since_last < _PROGRESS_MIN_INTERVAL
+            and pct_step < _PROGRESS_MIN_PERCENT_STEP
+            and written < (self.total or float("inf"))
+        ):
+            return
+        total_elapsed = now - self.start
+        speed = written / total_elapsed if total_elapsed > 0 else 0
+        if self.total:
+            eta = int((self.total - written) / speed) if speed > 0 else 0
+            self.log(
+                f"  ↳ {_human_bytes(written)}/{_human_bytes(self.total)} "
+                f"({pct}%, {_human_bytes(speed)}/s, eta {eta}s)"
+            )
+        else:
+            self.log(f"  ↳ {_human_bytes(written)} ({_human_bytes(speed)}/s)")
+        self.last_time = now
+        self.last_pct = pct
 
 
 def _local_md5(path: str) -> str | None:
@@ -544,15 +609,29 @@ def plan_sync(
 
 
 # ── execution ──────────────────────────────────────────────────────────────
-def _download_stream_to(sftp_or_local: str, iter_chunks) -> None:
-    """Write an iterator of bytes to a local path atomically (via .part rename)."""
-    tmp = sftp_or_local + ".part"
-    _mkdir_p(os.path.dirname(sftp_or_local))
+def _download_stream_to(
+    dest_path: str,
+    iter_chunks,
+    on_progress: Callable[[int], None] | None = None,
+) -> int:
+    """Write an iterator of bytes to a local path atomically (via .part rename).
+
+    Returns bytes written. Calls ``on_progress(bytes_written_so_far)`` after
+    each chunk if provided (throttling is the callback's responsibility).
+    """
+    tmp = dest_path + ".part"
+    _mkdir_p(os.path.dirname(dest_path))
+    written = 0
     with open(tmp, "wb") as f:
         for chunk in iter_chunks:
-            if chunk:
-                f.write(chunk)
-    os.replace(tmp, sftp_or_local)
+            if not chunk:
+                continue
+            f.write(chunk)
+            written += len(chunk)
+            if on_progress:
+                on_progress(written)
+    os.replace(tmp, dest_path)
+    return written
 
 
 def _sync_mtime_to_updated_at(local_path: str, updated_at_iso: str) -> None:
@@ -570,19 +649,23 @@ def _sync_mtime_to_updated_at(local_path: str, updated_at_iso: str) -> None:
         pass
 
 
-def _download_rom(client, action: SyncAction) -> int:
+def _download_rom(client, action: SyncAction, log: Callable[[str], None] | None = None) -> int:
     resp = client.stream_rom(action.rom_id, action.file_name)
     try:
-        _download_stream_to(action.remote_path, resp.iter_content())
+        total = int(resp.headers.get("content-length", 0)) or int(action.size_romm or 0)
+        reporter = _ProgressReporter(log, total)
+        _download_stream_to(action.remote_path, resp.iter_content(), on_progress=reporter.update)
     finally:
         resp.close()
     return action.size_romm or int(os.stat(action.remote_path).st_size)
 
 
-def _download_asset(client, action: SyncAction, asset_kind: str) -> None:
+def _download_asset(client, action: SyncAction, asset_kind: str, log: Callable[[str], None] | None = None) -> None:
     resp = client.stream_asset(asset_kind, action.asset_id)
     try:
-        _download_stream_to(action.remote_path, resp.iter_content())
+        total = int(resp.headers.get("content-length", 0)) or int(action.size_romm or 0)
+        reporter = _ProgressReporter(log, total)
+        _download_stream_to(action.remote_path, resp.iter_content(), on_progress=reporter.update)
     finally:
         resp.close()
     _sync_mtime_to_updated_at(action.remote_path, action.asset_updated_at)
@@ -647,13 +730,13 @@ def execute_sync(
                 _mark_placed(a); stats["skipped"] += 1
 
             elif a.kind == "download":
-                log(f"↓ {a.rom_name}  ({a.size_romm} B)")
-                _download_rom(client, a); _mark_placed(a); stats["downloaded"] += 1
+                log(f"↓ {a.rom_name}  ({_human_bytes(a.size_romm)})")
+                _download_rom(client, a, log=log); _mark_placed(a); stats["downloaded"] += 1
 
             elif a.kind == "overwrite":
                 if on_rom_conflict == RomConflictPolicy.ROMM_WINS:
-                    log(f"↓ overwrite {a.rom_name} (romm wins)")
-                    _download_rom(client, a); _mark_placed(a); stats["overwritten"] += 1
+                    log(f"↓ overwrite {a.rom_name} ({_human_bytes(a.size_romm)}, romm wins)")
+                    _download_rom(client, a, log=log); _mark_placed(a); stats["overwritten"] += 1
                 elif on_rom_conflict == RomConflictPolicy.MISTER_WINS:
                     log(f"= keep MiSTer copy of {a.file_name}"); stats["skipped"] += 1
                 else:
@@ -674,10 +757,12 @@ def execute_sync(
                 stats["saves_skip" if a.kind == "save_skip" else "states_skip"] += 1
 
             elif a.kind == "save_download":
-                log(f"↓ save {a.file_name}"); _download_asset(client, a, "save")
+                log(f"↓ save {a.file_name} ({_human_bytes(a.size_romm)})")
+                _download_asset(client, a, "save", log=log)
                 _mark_placed(a); stats["saves_down"] += 1
             elif a.kind == "state_download":
-                log(f"↓ state {a.file_name}"); _download_asset(client, a, "state")
+                log(f"↓ state {a.file_name} ({_human_bytes(a.size_romm)})")
+                _download_asset(client, a, "state", log=log)
                 _mark_placed(a); stats["states_down"] += 1
 
             elif a.kind == "save_upload":
@@ -693,11 +778,11 @@ def execute_sync(
                 if on_asset_conflict == AssetConflictPolicy.NEWEST_WINS:
                     # planner would've picked direction; conflict means times equal → prefer RomM.
                     log(f"↓ {kind} conflict → romm wins (times ambiguous) {a.file_name}")
-                    _download_asset(client, a, kind); _mark_placed(a)
+                    _download_asset(client, a, kind, log=log); _mark_placed(a)
                     stats["saves_down" if kind == "save" else "states_down"] += 1
                 elif on_asset_conflict == AssetConflictPolicy.ROMM_WINS:
                     log(f"↓ {kind} conflict → romm wins (policy) {a.file_name}")
-                    _download_asset(client, a, kind); _mark_placed(a)
+                    _download_asset(client, a, kind, log=log); _mark_placed(a)
                     stats["saves_down" if kind == "save" else "states_down"] += 1
                 elif on_asset_conflict == AssetConflictPolicy.MISTER_WINS:
                     log(f"↑ {kind} conflict → mister wins (policy) {a.file_name}")
@@ -758,12 +843,14 @@ def download_firmware_for_platform(
         except OSError:
             pass
         try:
+            log(f"  ↓ {fname} ({_human_bytes(r_size)})")
             resp = client.stream_firmware(fid, fname)
             try:
-                _download_stream_to(remote_path, resp.iter_content())
+                total = int(resp.headers.get("content-length", 0)) or r_size
+                reporter = _ProgressReporter(log, total)
+                _download_stream_to(remote_path, resp.iter_content(), on_progress=reporter.update)
             finally:
                 resp.close()
-            log(f"  ↓ {fname} ({r_size} B)")
             stats["downloaded"] += 1
             stats["bytes"] += r_size
         except Exception as exc:
