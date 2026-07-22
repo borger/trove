@@ -272,6 +272,40 @@ def cmd_update(args, log) -> int:
     return 0
 
 
+def _crond_running() -> bool:
+    """Detect a running BusyBox/Debian crond via `ps` (pgrep not on stock MiSTer)."""
+    try:
+        out = subprocess.check_output(["ps", "-ef"], stderr=subprocess.DEVNULL).decode()
+    except Exception:
+        try:
+            out = subprocess.check_output(["ps", "aux"], stderr=subprocess.DEVNULL).decode()
+        except Exception:
+            return False
+    return any("crond" in line and "grep" not in line for line in out.splitlines())
+
+
+def _cron_entry_state() -> tuple[bool, list[str]]:
+    """Report what cron entries we can find. Returns (any_found, [descriptions])."""
+    found: list[str] = []
+    for path in ("/var/spool/cron/crontabs/root", "/etc/cron.d/trove"):
+        try:
+            with open(path) as f:
+                content = f.read()
+            if "# TROVE" in content or "trove sync" in content:
+                # Extract our schedule line for display
+                for line in content.splitlines():
+                    if "# TROVE" in line or "trove sync" in line:
+                        found.append(f"{path}: {line.strip()}")
+                        break
+                else:
+                    found.append(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return bool(found), found
+
+
 def cmd_doctor(args, log) -> int:
     """Sanity-check the install."""
     ok = True
@@ -314,15 +348,19 @@ def cmd_doctor(args, log) -> int:
         except Exception:
             log.info("  MiSTer root OK: %s", root)
 
-    # Cron entry
-    try:
-        out = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
-        if "trove" in out.lower():
-            log.info("  cron: entry found")
-        else:
-            log.info("  cron: no trove entry (auto-sync disabled)")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        log.info("  cron: not configured")
+    # Cron — entry file AND running daemon
+    entries_found, entry_lines = _cron_entry_state()
+    if entries_found:
+        for line in entry_lines:
+            log.info("  cron entry: %s", line)
+    else:
+        log.info("  cron entry: NOT installed — re-run install.sh to add")
+
+    if _crond_running():
+        log.info("  crond daemon: running (auto-sync active)")
+    else:
+        log.info("  crond daemon: NOT running — auto-sync WILL NOT fire")
+        log.info("    fix: `trove enable-cron` (starts crond now + adds to /media/fat/linux/user-startup.sh)")
 
     # Update check
     try:
@@ -335,6 +373,45 @@ def cmd_doctor(args, log) -> int:
         log.info("  update: check failed (%s)", e)
 
     return 0 if ok else 1
+
+
+def cmd_enable_cron(args, log) -> int:
+    """Start BusyBox crond now AND persist to user-startup.sh."""
+    startup = Path("/media/fat/linux/user-startup.sh")
+    line = "/usr/sbin/crond -b"
+
+    # 1) Ensure the entry file exists (in case install.sh was run with --no-cron)
+    root_crontab = Path("/var/spool/cron/crontabs/root")
+    if not root_crontab.exists() or "# TROVE" not in root_crontab.read_text():
+        log.info("cron entry not present — run install.sh (without --no-cron) first.")
+        return 2
+
+    # 2) Start crond right now if not running
+    if _crond_running():
+        log.info("crond is already running.")
+    else:
+        try:
+            subprocess.check_call(["/usr/sbin/crond", "-b"])
+            log.info("crond started.")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            log.error("could not start crond: %s", e)
+            return 3
+
+    # 3) Persist to user-startup.sh
+    startup.parent.mkdir(parents=True, exist_ok=True)
+    existing = startup.read_text() if startup.exists() else ""
+    if line in existing:
+        log.info("crond already scheduled to start at boot in %s", startup)
+    else:
+        with startup.open("a") as f:
+            if not existing:
+                f.write("#!/bin/bash\n# MiSTer user startup.\n\n")
+            f.write(f"# Added by Trove — start BusyBox crond for /var/spool/cron/crontabs/root\n{line}\n")
+        os.chmod(startup, 0o755)
+        log.info("added crond start to %s (will run at next boot)", startup)
+
+    log.info("Done. Verify with: trove doctor")
+    return 0
 
 
 # ── entry ──────────────────────────────────────────────────────────────────
@@ -371,6 +448,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="sanity-check the install")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_enable_cron = sub.add_parser("enable-cron",
+        help="start crond now + persist to user-startup.sh so auto-sync fires")
+    p_enable_cron.set_defaults(func=cmd_enable_cron)
 
     return p
 

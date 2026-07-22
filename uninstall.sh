@@ -28,7 +28,17 @@ rm -f "$SCRIPTS_DIR/$LAUNCHER_NAME"
 
 log "removing cron entry"
 rm -f /etc/cron.d/trove
-# Legacy: also clean out anything we may have added to the root crontab.
+# BusyBox spool file — strip our line, keep other entries
+if [ -f /var/spool/cron/crontabs/root ]; then
+    tmp="$(mktemp)"
+    grep -v '# TROVE' /var/spool/cron/crontabs/root > "$tmp" 2>/dev/null || true
+    if [ -s "$tmp" ]; then
+        mv "$tmp" /var/spool/cron/crontabs/root
+    else
+        rm -f /var/spool/cron/crontabs/root "$tmp"
+    fi
+fi
+# Legacy: also clean the classic user crontab if present
 if command -v crontab >/dev/null 2>&1; then
     (crontab -l 2>/dev/null | grep -v '# TROVE') 2>/dev/null | crontab - 2>/dev/null || true
 fi
