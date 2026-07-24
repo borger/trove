@@ -1,119 +1,181 @@
 # Trove
 
-A tiny, headless MiSTer companion that keeps your MiSTer library in sync with a self-hosted [RomM](https://github.com/rommapp/romm) server.
+Headless MiSTer companion that keeps your MiSTer FPGA library in sync with a self-hosted [RomM](https://github.com/rommapp/romm) server. Ships as a single-file installer, uses only Python's standard library, and physically cannot delete files it didn't place — safe to run against a library you've spent years curating.
 
-Ships as a single-file installer, needs no compilation, no pip, no Docker, and no external Python packages — just what's already on a stock MiSTer install.
+## Features
 
-## What it does today (v0.1)
+- **Pair once, sync forever** — one 60-second pairing code from RomM's web UI. No passwords stored.
+- **Interactive collection picker** — `trove collections` opens a multi-select TUI; no JSON editing.
+- **Two-way saves & states** — MiSTer-side saves upload to RomM, RomM edits pull down. Newest-wins reconciliation with MD5 verification.
+- **BIOS/firmware download** — per platform, or every subscribed platform in one shot.
+- **Live download progress** — bytes transferred, percent, speed, and ETA for anything larger than 5 MB. Instant completion on any size.
+- **Scheduled auto-sync** — one command sets up BusyBox `crond` at boot and registers the schedule.
+- **Self-update** — `trove update` pulls the latest release from GitHub.
+- **Doctor** — `trove doctor` reports RomM reachability, MiSTer paths, cron state, and disk space in one shot.
+- **Runs from the MiSTer Scripts menu** — controller-friendly whiptail menu, no terminal required.
 
-- **Pair** with your RomM instance via a 60-second short code (no password stored).
-- **Sync one or more collections** from RomM to `/media/fat/games/<Core>/`, matching MiSTer's folder conventions.
-- **Two-way saves & states** — new MiSTer saves upload to RomM, RomM edits pull down. Optional; disabled by default until you've tried a dry-run.
-- **BIOS/firmware download** per platform (or every subscribed platform in one shot).
-- **Cron auto-sync** — installer schedules a nightly run; the schedule is configurable.
-- **Self-update** — `trove update` grabs the latest release from GitHub.
-- **Doctor** — `trove doctor` checks RomM reachability, MiSTer paths, cron entry, and disk space.
+## Safety by design
 
-## What it explicitly won't do
+Trove was built for MiSTer users with libraries they've curated over years. Two architectural guarantees:
 
-- Delete anything it didn't place there. Files you had before installing Trove are invisible to its cleanup logic — they stay put unless you deliberately remove them.
-- Auto-update itself. Updates only happen when you run `trove update`.
+1. **Orphan detection is manifest-scoped.** Trove records every file it places on the MiSTer, keyed by relative path with `{mtime, size, hash}` metadata. Only files present in that manifest can ever be considered for deletion. Files you had before installing Trove are invisible to the cleanup logic — they will not be touched, ever, regardless of what you subscribe to or unsubscribe from.
+2. **Save uploads are gated on ROM management.** Trove uploads a MiSTer-side save/state to RomM only when the corresponding ROM is one Trove itself is managing. Pre-existing saves for pre-existing ROMs stay local.
+
+If either of these ever misbehaves, please open an issue with your `trove.log` attached.
 
 ## Requirements
 
-- MiSTer FPGA with the standard Linux userland (`python3` present — this comes with the default MiSTer distribution).
+- MiSTer FPGA with Python 3 available (present on any standard MiSTer install with `update_all`).
 - A running [RomM](https://github.com/rommapp/romm) instance (v5.0.0 or later) reachable from the MiSTer's network.
-- One RomM API token — Trove will help you create it on first run.
 
-Trove uses only the Python standard library. There is nothing to `pip install`.
+No `pip`, no external Python packages, no Docker.
 
 ## Install
 
-From your MiSTer (SSH in, or via the Scripts menu with an `install_trove.sh` script):
+SSH into your MiSTer (or open a shell via the Scripts menu) and run:
 
 ```bash
 curl -kL https://raw.githubusercontent.com/borger/trove/main/install.sh | bash
 ```
 
-This installs to `/media/fat/Scripts/.trove/` and drops a `trove.sh` entry into MiSTer's Scripts menu.
+This installs to `/media/fat/Scripts/.trove/` and drops a `trove.sh` entry into MiSTer's Scripts menu so you can drive everything with a controller.
 
-## Pair with RomM
-
-1. In RomM's web UI: **Control Panel → API Keys → Pair Device** (generates an 8-character code, valid for 60 seconds).
-2. On the MiSTer:
-
-    ```bash
-    /media/fat/Scripts/.trove/bin/trove pair
-    ```
-
-   Enter the RomM URL and the pairing code. Trove stores the resulting bearer token in its config.
-
-## Subscribe to a collection
-
-Open the config:
+To set up scheduled auto-sync at the same time (starts crond now, adds it to `user-startup.sh`, registers the schedule):
 
 ```bash
-/media/fat/Scripts/.trove/bin/trove config
+curl -kL https://raw.githubusercontent.com/borger/trove/main/install.sh | bash -s -- --enable-cron
 ```
 
-Add your collection IDs under `subscriptions.collections`. You can find these in RomM's URL when viewing a collection.
+## First-run
 
-## First sync
+Three commands from a fresh install:
 
-Preview what would happen without changing anything:
+### 1. Pair with RomM
+
+In RomM's web UI: **Control Panel → API Keys → Pair Device**. You'll get an 8-character code, valid for 60 seconds.
+
+On the MiSTer:
+
+```bash
+/media/fat/Scripts/.trove/bin/trove pair
+```
+
+Enter the RomM URL when prompted, paste the pairing code.
+
+### 2. Subscribe to collections
+
+```bash
+/media/fat/Scripts/.trove/bin/trove collections
+```
+
+Opens an interactive picker: **Space** to toggle, **Enter** to save, **Esc** to cancel. All your RomM collections appear with ROM counts, sorted by size so the meaty ones surface first.
+
+### 3. Sync
+
+Preview first — recommended on the first run so you can eyeball the plan:
 
 ```bash
 /media/fat/Scripts/.trove/bin/trove sync --dry-run
 ```
 
-When happy:
+Then, for real:
 
 ```bash
 /media/fat/Scripts/.trove/bin/trove sync
 ```
 
+## Auto-sync (BusyBox cron)
+
+MiSTer ships `crond` (via BusyBox) but doesn't start it by default. Enabling scheduled sync is a single command:
+
+```bash
+/media/fat/Scripts/.trove/bin/trove enable-cron
+```
+
+This starts crond immediately AND appends `/usr/sbin/crond -b` to `/media/fat/linux/user-startup.sh` so it runs at every boot. Trove's schedule (`0 3 * * *` — daily at 3 AM by default) is already registered.
+
+To pause auto-sync without uninstalling:
+
+```bash
+/media/fat/Scripts/.trove/bin/trove disable-cron
+```
+
+Stops crond, removes the boot line. The schedule file stays in place so `trove enable-cron` resumes cleanly.
+
+To change the schedule: edit `cron.schedule` in `config.json`, then re-run `trove enable-cron`.
+
+## From the MiSTer Scripts menu
+
+Everything above is available without a terminal — from the MiSTer's Scripts menu, pick **trove.sh** and you get a whiptail menu with:
+
+- **status** / **pair** / **collections**
+- **sync** (and **sync-dry** for a preview)
+- **bios-all** (download BIOS for every subscribed platform)
+- **config** / **doctor**
+- **enable-cron** / **disable-cron**
+- **update** / **logs**
+
+Full controller navigation, no keyboard needed.
+
 ## Command reference
 
 | Command | What it does |
 |---|---|
-| `trove pair` | Pair with a RomM instance (URL + short code) |
-| `trove sync` | Run a sync now (`--dry-run` to preview) |
-| `trove bios <slug>` | Download BIOS for one platform (or `all` for every subscribed one) |
+| `trove pair [--url URL] [--code CODE]` | Pair with a RomM instance |
+| `trove collections` | Interactive picker for subscribed collections |
+| `trove collections list` | Print subscribed + available collections |
+| `trove collections add <ids…>` | Subscribe to collection IDs |
+| `trove collections remove <ids…>` | Unsubscribe from collection IDs |
+| `trove sync [--dry-run]` | Run sync (or preview) |
+| `trove bios <slug\|all>` | Download BIOS for one platform, or every subscribed one |
 | `trove status` | Show install + subscription summary |
-| `trove config` | Edit `config.json` in `$EDITOR` (falls back to `vi`) |
-| `trove doctor` | Sanity-check RomM reachability, paths, cron, disk |
+| `trove config` | Edit `config.json` in `$EDITOR` |
+| `trove doctor` | Sanity-check RomM, MiSTer paths, cron, disk |
+| `trove enable-cron` | Start crond now + persist to `user-startup.sh` |
+| `trove disable-cron` | Stop crond + remove `user-startup.sh` line |
 | `trove update [--check]` | Update from GitHub Releases |
 
-All commands accept `-v` (verbose) and `-q` (quiet — file log still writes).
+All commands accept `-v` (DEBUG logging) and `-q` (silence console; the file log still writes).
 
 ## Config reference
 
-Trove's config lives at `/media/fat/Scripts/.trove/config.json`. A commented example is available at [`config.example.json`](config.example.json). Key fields:
+Config lives at `/media/fat/Scripts/.trove/config.json`. Example with sensible defaults: [`config.example.json`](config.example.json).
 
-- **`romm.url`** — your RomM instance URL. Set by `trove pair`.
-- **`romm.token`** — bearer token from pairing. Do not edit by hand.
-- **`mister.root`** — where MiSTer stores games. Defaults to `/media/fat`; change to `/media/usb0` or `/media/network` if your library lives there.
-- **`subscriptions.collections`** — array of RomM collection IDs to sync.
-- **`sync.saves_and_states`** — enable bidirectional save/state sync. Default: `true`.
-- **`sync.on_rom_conflict`** — what to do when a ROM exists on both sides with different sizes. One of `romm_wins` / `mister_wins` / `skip`. Default: `romm_wins`.
-- **`sync.on_asset_conflict`** — what to do when a save/state differs and timestamps are ambiguous. One of `newest_wins` / `romm_wins` / `mister_wins` / `skip`. Default: `newest_wins`.
-- **`sync.on_orphan`** — what to do with files Trove previously downloaded that are no longer in any subscription. One of `keep` / `delete`. Default: `keep`.
-- **`sync.emulator_filter`** — `mister_only` skips saves/states tagged for other emulators (RetroArch, fceux, dolphin, …). `allow_all` pulls everything. Default: `mister_only`.
-- **`cron.schedule`** — cron-format schedule for auto-sync. Default: `0 3 * * *` (3 AM daily).
-- **`cron.enabled`** — informational; the installer manages the actual cron entry.
+- **`romm.url`** — RomM URL. Populated by `trove pair`.
+- **`romm.token`** — Bearer token. Populated by `trove pair`. Do not edit by hand.
+- **`mister.root`** — Where MiSTer keeps games. Default `/media/fat`; change to `/media/usb0` or `/media/network` if your library lives there.
+- **`subscriptions.collections`** — Array of collection IDs to sync. Managed by `trove collections`.
+- **`sync.saves_and_states`** — Enable bidirectional save/state sync. Default: `true`.
+- **`sync.on_rom_conflict`** — When a ROM exists on both sides with different sizes: `romm_wins` / `mister_wins` / `skip`. Default: `romm_wins`.
+- **`sync.on_asset_conflict`** — When a save/state differs and timestamps are ambiguous: `newest_wins` / `romm_wins` / `mister_wins` / `skip`. Default: `newest_wins`.
+- **`sync.on_orphan`** — When Trove-placed files no longer belong to any subscription: `keep` / `delete`. Default: `keep`.
+- **`sync.emulator_filter`** — `mister_only` skips saves/states tagged for other emulators (RetroArch, fceux, dolphin, …); `allow_all` pulls everything. Default: `mister_only`.
+- **`cron.schedule`** — Cron-format schedule for auto-sync. Default: `0 3 * * *` (daily at 3 AM).
 - **`logging.level`** — `DEBUG` / `INFO` / `WARNING` / `ERROR`. Default: `INFO`.
-- **`core_overrides`** — per-slug MiSTer folder overrides for non-standard setups. Example: `{"genesis": "Genesis"}` if your Sega Mega Drive lives at `/media/fat/games/Genesis/` instead of the default `MegaDrive`.
+- **`core_overrides`** — Per-slug MiSTer folder overrides for non-standard setups. Example: `{"genesis": "Genesis"}` if your Sega Mega Drive folder is `/media/fat/games/Genesis/` instead of the default `MegaDrive`.
 
-## Where things live on the MiSTer
+## Where things live
 
-- Install root: `/media/fat/Scripts/.trove/`
-- Config: `/media/fat/Scripts/.trove/config.json`
-- Manifest (what Trove has placed): `/media/fat/Scripts/.trove/manifest.json`
-- Logs: `/media/fat/Scripts/.trove/logs/trove.log` (rotated at 5 MB × 3)
-- Downloaded ROMs: `/media/fat/games/<Core>/<file>`
-- Downloaded saves: `/media/fat/saves/<Core>/<file>`
-- Downloaded states: `/media/fat/savestates/<Core>/<file>`
-- Downloaded BIOS: `/media/fat/games/<Core>/bios/<file>` (rename per your core's convention — see [MiSTer wiki](https://mister-devel.github.io/MkDocs_MiSTer/setup/games/))
+| Path | What |
+|---|---|
+| `/media/fat/Scripts/.trove/` | Install root |
+| `/media/fat/Scripts/.trove/config.json` | Configuration |
+| `/media/fat/Scripts/.trove/manifest.json` | Placement records (mtime + size + hash) |
+| `/media/fat/Scripts/.trove/logs/trove.log` | Rotating log (5 MB × 3) |
+| `/media/fat/Scripts/trove.sh` | Symlink into the Scripts menu |
+| `/var/spool/cron/crontabs/root` | BusyBox cron entry (installed by Trove) |
+| `/media/fat/games/<Core>/<file>` | Downloaded ROMs |
+| `/media/fat/saves/<Core>/<file>` | Downloaded saves |
+| `/media/fat/savestates/<Core>/<file>` | Downloaded states |
+| `/media/fat/games/<Core>/bios/<file>` | Downloaded BIOS (see the [MiSTer wiki](https://mister-devel.github.io/MkDocs_MiSTer/setup/games/) for per-core naming conventions) |
+
+## Update
+
+```bash
+/media/fat/Scripts/.trove/bin/trove update
+```
+
+Preserves your config, manifest, and logs across upgrades. Or just re-run `install.sh` — same result.
 
 ## Uninstall
 
@@ -121,16 +183,7 @@ Trove's config lives at `/media/fat/Scripts/.trove/config.json`. A commented exa
 /media/fat/Scripts/.trove/uninstall.sh
 ```
 
-By default this preserves `config.json`, `manifest.json`, and `logs/` so a re-install picks them up. Pass `--purge` to remove those too.
-
-## Safety notes
-
-Trove was designed for MiSTer users who have been curating their library for years. Two rules matter most:
-
-1. **Orphan detection is manifest-scoped.** Trove remembers every file it has placed on the MiSTer (per-file, keyed by relative path, with `{mtime, size, hash}` metadata). Only files in that manifest can ever be considered for deletion. Pre-existing files you had before Trove are invisible to its cleanup logic — they will not be touched, ever, regardless of subscription state.
-2. **Save uploads are gated on ROM management.** Trove will only upload a MiSTer-side save/state to RomM if the corresponding ROM is one Trove itself is managing. Pre-existing saves for pre-existing ROMs stay local.
-
-If either of these ever misbehaves, please open an issue with your `trove.log`.
+Preserves `config.json`, `manifest.json`, and `logs/` by default so a re-install picks them up. Pass `--purge` to remove everything.
 
 ## License
 
