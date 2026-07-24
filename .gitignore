@@ -10,3 +10,8 @@ logs/
 manifest.json
 config.json
 !config.example.json
+
+# Local, uncommitted contributor / AI-assistant guidance
+AGENTS.md
+CLAUDE.md
+.cursorrules

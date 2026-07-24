@@ -63,18 +63,19 @@ if [ -n "$NOTES_FILE" ]; then
 elif [ -n "$NOTES_INLINE" ]; then
     printf '%s\n' "$NOTES_INLINE" > "$NOTES_TMP"
 else
-    # Interactive: seed the buffer with a template + commit-log helper.
+    # Interactive: seed the buffer with a bare template + the raw commit log
+    # since the previous tag. Rewrite as prose in the editor before saving.
     PREV_TAG="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
     {
-        printf '## What changed\n\n'
-        printf '<!-- Replace this with a human-written paragraph. -->\n\n'
+        printf '## What'"'"'s new\n\n\n\n'
         printf '## Upgrade\n\n'
         printf '```\ncurl -kL https://raw.githubusercontent.com/borger/trove/%s/install.sh | bash\n```\n' "$TAG"
         printf '\n'
         if [ -n "$PREV_TAG" ]; then
-            printf '<!-- Commits since %s (delete once you rewrite as prose):\n\n' "$PREV_TAG"
+            printf '---\n'
+            printf 'commits since %s (delete this block before saving):\n\n' "$PREV_TAG"
             git log --pretty=format:'* %s' "${PREV_TAG}..HEAD" 2>/dev/null
-            printf '\n\n-->\n'
+            printf '\n'
         fi
     } > "$NOTES_TMP"
     EDITOR_CMD="${EDITOR:-vi}"
