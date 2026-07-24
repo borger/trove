@@ -30,9 +30,10 @@ pause() {
 }
 
 while true; do
-    CHOICE=$(whiptail --title "$TITLE" --menu "Choose an action" 22 78 14 \
+    CHOICE=$(whiptail --title "$TITLE" --menu "Choose an action" 22 78 15 \
         "status"        "Show install + subscription summary" \
         "pair"          "Pair with a RomM server (60s code)" \
+        "collections"   "Pick subscribed collections (interactive)" \
         "sync-dry"      "Preview sync (dry-run, no changes)" \
         "sync"          "Run sync now" \
         "bios-all"      "Download BIOS for all subscribed platforms" \
@@ -49,6 +50,7 @@ while true; do
     case "$CHOICE" in
         status)        "$TROVE" status; pause ;;
         pair)          "$TROVE" pair; pause ;;
+        collections)   "$TROVE" collections; pause ;;
         sync-dry)      "$TROVE" sync --dry-run; pause ;;
         sync)          "$TROVE" sync; pause ;;
         bios-all)      "$TROVE" bios all; pause ;;

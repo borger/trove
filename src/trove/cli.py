@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -204,6 +205,183 @@ def cmd_bios(args, log) -> int:
             return 0
     finally:
         lock.close()
+
+
+def _sorted_collections(collections: list[dict]) -> list[dict]:
+    return sorted(
+        collections,
+        key=lambda c: (-int(c.get("rom_count") or 0), (c.get("name") or "").lower()),
+    )
+
+
+def _whiptail_available() -> bool:
+    return shutil.which("whiptail") is not None
+
+
+def _whiptail_pick_collections(collections: list[dict], subscribed: set[int]) -> set[int] | None:
+    """whiptail --checklist. Returns the new selected-set, or None if cancelled."""
+    sorted_c = _sorted_collections(collections)
+    argv = [
+        "whiptail", "--separate-output",
+        "--title", "Trove — subscribed collections",
+        "--checklist",
+        "SPACE toggles, ENTER saves, ESC cancels.",
+        "22", "80", "14",
+    ]
+    for c in sorted_c:
+        cid = str(c.get("id"))
+        name = c.get("name") or "(unnamed)"
+        n = int(c.get("rom_count") or 0)
+        argv += [cid, f"{name}  ({n} roms)", "ON" if int(cid) in subscribed else "OFF"]
+    result = subprocess.run(argv, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:   # user hit ESC or Cancel
+        return None
+    return {int(x) for x in result.stderr.strip().splitlines() if x.strip()}
+
+
+def _text_pick_collections(collections: list[dict], subscribed: set[int]) -> set[int] | None:
+    """Numbered-list toggle picker for terminals without whiptail."""
+    sorted_c = _sorted_collections(collections)
+    selected = set(subscribed)
+    print("\nSubscribed collections marked [x]. Enter a number to toggle.\n"
+          "Blank line to save, `q` to cancel.\n")
+    while True:
+        print()
+        for i, c in enumerate(sorted_c, 1):
+            cid = int(c.get("id"))
+            mark = "x" if cid in selected else " "
+            n = int(c.get("rom_count") or 0)
+            print(f"  {i:3}) [{mark}] {c.get('name') or '(unnamed)':<40} {n:>5} roms")
+        try:
+            raw = input("\nToggle: ").strip()
+        except EOFError:
+            return None
+        if raw == "":
+            return selected
+        if raw.lower() == "q":
+            return None
+        try:
+            idx = int(raw)
+        except ValueError:
+            print(f"  invalid: {raw}")
+            continue
+        if not 1 <= idx <= len(sorted_c):
+            print("  out of range")
+            continue
+        cid = int(sorted_c[idx - 1].get("id"))
+        if cid in selected:
+            selected.remove(cid)
+        else:
+            selected.add(cid)
+
+
+def cmd_collections(args, log) -> int:
+    """Dispatcher for `collections` — subcommand or interactive default."""
+    sub_cmd = getattr(args, "coll_cmd", None) or "pick"
+    handler = {
+        "pick": _collections_pick,
+        "list": _collections_list,
+        "add": _collections_add,
+        "remove": _collections_remove,
+    }.get(sub_cmd)
+    if handler is None:
+        log.error("Unknown collections subcommand: %s", sub_cmd)
+        return 2
+    return handler(args, log)
+
+
+def _require_paired(cfg: dict, log) -> bool:
+    if not (cfg.get("romm") or {}).get("token"):
+        log.error("Not paired with RomM. Run `trove pair` first.")
+        return False
+    return True
+
+
+def _collections_pick(args, log) -> int:
+    cfg = config.load()
+    if not _require_paired(cfg, log):
+        return 2
+    client = _client(cfg)
+    log.info("Fetching collections from RomM…")
+    try:
+        collections = client.get_collections() or []
+    except RomMError as e:
+        log.error("Failed to fetch collections: %s", e)
+        return 3
+    if not collections:
+        log.info("No collections on RomM yet. Create some at your RomM UI and try again.")
+        return 0
+    subscribed = set(cfg["subscriptions"]["collections"])
+    if _whiptail_available():
+        new_selected = _whiptail_pick_collections(collections, subscribed)
+    else:
+        new_selected = _text_pick_collections(collections, subscribed)
+    if new_selected is None:
+        log.info("Cancelled — no changes.")
+        return 0
+    cfg["subscriptions"]["collections"] = sorted(new_selected)
+    config.save(cfg)
+    added = new_selected - subscribed
+    removed = subscribed - new_selected
+    log.info("Saved. Now subscribed to %d collection(s). (+%d added, -%d removed)",
+             len(new_selected), len(added), len(removed))
+    return 0
+
+
+def _collections_list(args, log) -> int:
+    cfg = config.load()
+    subs = set(cfg["subscriptions"]["collections"])
+    if not _require_paired(cfg, log):
+        # Fall back to just showing what's in config if not paired.
+        log.info("Currently subscribed (from config): %s",
+                 ", ".join(map(str, sorted(subs))) or "(none)")
+        return 0
+    try:
+        client = _client(cfg)
+        all_c = client.get_collections() or []
+    except RomMError as e:
+        log.error("Fetch failed: %s", e)
+        return 3
+    by_id = {int(c.get("id")): c for c in all_c if c.get("id") is not None}
+    log.info("Subscribed (%d):", len(subs))
+    for cid in sorted(subs):
+        c = by_id.get(cid)
+        if c:
+            log.info("  %6d  %-40s  %d roms", cid, c.get("name") or "?", int(c.get("rom_count") or 0))
+        else:
+            log.info("  %6d  (not on RomM — orphaned subscription)", cid)
+    log.info("")
+    log.info("Available (%d):", len(all_c))
+    for c in _sorted_collections(all_c):
+        cid = int(c.get("id"))
+        marker = "★" if cid in subs else " "
+        log.info("  %s %6d  %-40s  %d roms",
+                 marker, cid, c.get("name") or "?", int(c.get("rom_count") or 0))
+    return 0
+
+
+def _collections_add(args, log) -> int:
+    cfg = config.load()
+    subs = set(cfg["subscriptions"]["collections"])
+    for cid in args.ids:
+        subs.add(int(cid))
+    cfg["subscriptions"]["collections"] = sorted(subs)
+    config.save(cfg)
+    log.info("Now subscribed to %d collection(s): %s",
+             len(subs), ", ".join(map(str, sorted(subs))) or "(none)")
+    return 0
+
+
+def _collections_remove(args, log) -> int:
+    cfg = config.load()
+    subs = set(cfg["subscriptions"]["collections"])
+    for cid in args.ids:
+        subs.discard(int(cid))
+    cfg["subscriptions"]["collections"] = sorted(subs)
+    config.save(cfg)
+    log.info("Now subscribed to %d collection(s): %s",
+             len(subs), ", ".join(map(str, sorted(subs))) or "(none)")
+    return 0
 
 
 def cmd_status(args, log) -> int:
@@ -508,6 +686,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="show current install + subscription summary")
     p_status.set_defaults(func=cmd_status)
+
+    p_coll = sub.add_parser("collections",
+        help="manage subscribed collections (interactive picker or scriptable subcommands)")
+    p_coll.set_defaults(func=cmd_collections)
+    coll_sub = p_coll.add_subparsers(dest="coll_cmd")
+    coll_sub.add_parser("list", help="show subscribed + available collections")
+    p_add = coll_sub.add_parser("add", help="subscribe to one or more collection IDs")
+    p_add.add_argument("ids", nargs="+", type=int)
+    p_rm = coll_sub.add_parser("remove", help="unsubscribe from one or more collection IDs")
+    p_rm.add_argument("ids", nargs="+", type=int)
 
     p_config = sub.add_parser("config", help="edit config.json in $EDITOR")
     p_config.set_defaults(func=cmd_config)
